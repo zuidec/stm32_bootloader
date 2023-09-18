@@ -1,10 +1,23 @@
-#include <stdio.h>
+#include <libopencm3/stm32/gpio.h>
+#include <libopencm3/stm32/rcc.h>
 #include <libopencm3/stm32/memorymap.h>
 #include <libopencm3/cm3/vector.h>
 
-#define FLASH_BASE                      (0x00000000U)
+#include "core/common-defines.h"
+#include "core/comms.h"
+#include "core/uart.h"
+#include "core/system.h"
+
+//#define FLASH_BASE                      (0x00000000U)
 #define BOOTLOADER_SIZE                 (0x8000U)
 #define MAIN_APP_START_ADDRESS          (FLASH_BASE + BOOTLOADER_SIZE)
+
+#define LED_PORT            (GPIOA)
+#define LED_PIN             (GPIO0)
+
+#define UART2_PORT          (GPIOA)
+#define RX2_PIN             (GPIO3)
+#define TX2_PIN             (GPIO2)
 
 void jump_to_main_application (void);
 void jump_to_main_application (void) {
@@ -15,26 +28,50 @@ void jump_to_main_application (void) {
     // Use the reset function to jump to the main application
     main_app_vector_table->reset();
     
-    
-    
-    
-    /*// Programming magic to use a function pointer
-    typedef void (*void_fn)(void);
+}
 
-    // Set up the pointer to the vector table of the main app
-    uint32_t* reset_vector_entry = (uint32_t*)(MAIN_APP_START_ADDRESS + 4U);
-    uint32_t* reset_vector = (uint32_t*)(*reset_vector_entry);
+static void gpio_setup(void)    {
+    rcc_periph_clock_enable(RCC_GPIOA);
+    
+    // Set gpio to alternate function, then set the alternate function to AF1 (TIM2)
+    gpio_mode_setup(LED_PORT, GPIO_MODE_OUTPUT, GPIO_PUPD_NONE, LED_PIN);
+    //gpio_set_af(LED_PORT, GPIO_AF1, LED_PIN);
 
-    // Tell the program that this function lives at the address in reset_vector
-    void_fn jump_fn = (void_fn)reset_vector;
-
-    // Jump to the main application
-    jump_fn();
-    */
+    // Set up UART2 and change the pins to alternate function
+    gpio_mode_setup(UART2_PORT, GPIO_MODE_AF, GPIO_PUPD_NONE, TX2_PIN | RX2_PIN );
+    gpio_set_af(UART2_PORT,GPIO_AF7, TX2_PIN | RX2_PIN );
+    
 }
 
 int main(void)  {
     
+    gpio_setup();
+    system_setup();
+    //timer_setup();
+    // Set up UART
+    uart_setup();
+    comms_setup();
+
+    comms_packet_t packet = {
+        .length = 9,
+        .payload = {1, 2, 3, 4, 5, 6, 7, 8, 9, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff},
+        .crc = 0,
+    };
+    comms_packet_t rx_packet;
+    packet.crc = comms_compute_crc(&packet);
+
+    while(true) {
+        
+        comms_update();
+        if(comms_packets_available())   {
+            comms_read(&rx_packet);
+        }
+        comms_write(&packet);
+        gpio_toggle(LED_PORT, LED_PIN);
+        system_delay(500);
+        
+    }
+
     jump_to_main_application();
 
     // Never return

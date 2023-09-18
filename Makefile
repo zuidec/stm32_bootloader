@@ -60,7 +60,10 @@ CSTD		?= -std=c99
 OBJS		+= $(SRC_DIR)/$(BINARY).o
 OBJS		+= $(SHARED_SRC_DIR)/core/system.o
 OBJS		+= $(SHARED_SRC_DIR)/core/timer.o
-
+OBJS		+= $(SHARED_SRC_DIR)/core/uart.o
+OBJS		+= $(SHARED_SRC_DIR)/core/fifo.o
+OBJS		+= $(SHARED_SRC_DIR)/core/comms.o
+OBJS		+= $(SHARED_SRC_DIR)/core/crc8.o
 
 ###############################################################################
 # C flags
