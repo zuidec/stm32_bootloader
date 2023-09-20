@@ -2,6 +2,7 @@
 #include <libopencm3/stm32/rcc.h>
 #include <libopencm3/stm32/memorymap.h>
 #include <libopencm3/cm3/vector.h>
+#include <libopencm3/cm3/scb.h>
 
 #include "core/common-defines.h"
 #include "core/comms.h"
@@ -9,22 +10,18 @@
 #include "core/system.h"
 #include "core/simple-timer.h"
 #include "core/bootloader-flash.h"
+#include "core/firmware-info.h"
+#include "core/crc.h"
 
 
-#define BOOTLOADER_SIZE                 (0x8000U)
-#define MAIN_APP_START_ADDRESS          (FLASH_BASE + BOOTLOADER_SIZE)
+#define DEFAULT_TIMEOUT     (5000)
 
-#define DEFAULT_TIMEOUT     (10000)
-
-#define LED_PORT            (GPIOA)
-#define LED_PIN             (GPIO0)
+#define LED_PORT            (GPIOC)
+#define LED_PIN             (GPIO13)
 
 #define UART2_PORT          (GPIOA)
 #define RX2_PIN             (GPIO3)
 #define TX2_PIN             (GPIO2)
-
-#define DEVICE_ID           (0x42)
-#define MAX_FW_LENGTH       ((1024U * 512U) - BOOTLOADER_SIZE)
 
 typedef enum bl_state_t {
     BL_State_Sync,
@@ -58,10 +55,11 @@ void jump_to_main_application (void) {
 
 static void gpio_setup(void)    {
     rcc_periph_clock_enable(RCC_GPIOA);
+    rcc_periph_clock_enable(RCC_GPIOC);
     
     // Set gpio to alternate function, then set the alternate function to AF1 (TIM2)
-    // gpio_mode_setup(LED_PORT, GPIO_MODE_OUTPUT, GPIO_PUPD_NONE, LED_PIN);
-    //gpio_set_af(LED_PORT, GPIO_AF1, LED_PIN);
+    gpio_mode_setup(LED_PORT, GPIO_MODE_OUTPUT, GPIO_PUPD_NONE, LED_PIN);
+    gpio_clear(LED_PORT,LED_PIN);
 
     // Set up UART2 and change the pins to alternate function
     gpio_mode_setup(UART2_PORT, GPIO_MODE_AF, GPIO_PUPD_NONE, TX2_PIN | RX2_PIN );
@@ -75,11 +73,14 @@ static void gpio_teardown(void)    {
     // Set gpio to alternate function, then set the alternate function to AF1 (TIM2)
     // gpio_mode_setup(LED_PORT, GPIO_MODE_OUTPUT, GPIO_PUPD_NONE, LED_PIN);
     //gpio_set_af(LED_PORT, GPIO_AF1, LED_PIN);
+    gpio_clear(LED_PORT,LED_PIN);
+    gpio_mode_setup(LED_PORT, GPIO_MODE_ANALOG, GPIO_PUPD_NONE, LED_PIN);
 
     // Set up UART2 and change the pins to alternate function
     gpio_mode_setup(UART2_PORT, GPIO_MODE_ANALOG, GPIO_PUPD_NONE, TX2_PIN | RX2_PIN );
 
     rcc_periph_clock_disable(RCC_GPIOA);
+    rcc_periph_clock_disable(RCC_GPIOC);
     
 }
 
@@ -94,7 +95,6 @@ static void check_for_timeout(void) {
         exit_bootloader();
     }
 }
-
 
 static bool is_device_id_packet(const comms_packet_t* packet) {
     if(packet->length < 2)   {
@@ -126,6 +126,22 @@ static bool is_fw_length_packet(const comms_packet_t* packet) {
     return true;
 }
 
+static bool validate_firmware_image(void)   {
+    firmware_info_t* firmware_info = (firmware_info_t*)FW_INFO_ADDRESS;
+
+    if(firmware_info->sentinel != FW_INFO_SENTINEL) {
+        return false;
+    }
+    if(firmware_info->device_id != DEVICE_ID)   {
+        return false;
+    }
+
+    const uint8_t* start_address = (const uint8_t*)FW_INFO_VALIDATE_FROM;
+    const uint32_t computed_crc = crc32(start_address,FW_INFO_VALIDATE_LENGTH(firmware_info->length));
+
+    return computed_crc == firmware_info->crc32;
+}
+
 int main(void)  {
     
     gpio_setup();
@@ -136,157 +152,154 @@ int main(void)  {
     comms_setup();
     simple_timer_setup(&timer, DEFAULT_TIMEOUT, false);
 
-
+    uint64_t last_led_toggle = system_get_ticks();
 
     while(state != BL_State_Done) {
-             if(state == BL_State_Sync)    {
-                if(uart_data_available())   {
-                    sync_seq[0] = sync_seq[1];
-                    sync_seq[1] = sync_seq[2];
-                    sync_seq[2] = sync_seq[3];
-                    sync_seq[3] = uart_read_byte();
 
-                    bool is_match = sync_seq[0] == SYNC_SEQ_0;
-                    is_match = is_match && (sync_seq[1] == SYNC_SEQ_1);
-                    is_match = is_match && (sync_seq[2] == SYNC_SEQ_2);
-                    is_match = is_match && (sync_seq[3] == SYNC_SEQ_3);
-
-                    if(is_match)    {
-                        comms_create_single_byte_packet(&temp_packet, BL_PACKET_SYNC_OBSERVED_PAYLOAD);
+        if(system_get_ticks()-last_led_toggle >= 500)  {
+            gpio_toggle(LED_PORT,LED_PIN);
+            last_led_toggle = system_get_ticks();
+        }
+        if(state == BL_State_Sync)    {
+            if(uart_data_available())   {
+                sync_seq[0] = sync_seq[1];
+                sync_seq[1] = sync_seq[2];
+                sync_seq[2] = sync_seq[3];
+                sync_seq[3] = uart_read_byte();
+                bool is_match = sync_seq[0] == SYNC_SEQ_0;
+                is_match = is_match && (sync_seq[1] == SYNC_SEQ_1);
+                is_match = is_match && (sync_seq[2] == SYNC_SEQ_2);
+                is_match = is_match && (sync_seq[3] == SYNC_SEQ_3);
+                if(is_match)    {
+                    comms_create_single_byte_packet(&temp_packet, BL_PACKET_SYNC_OBSERVED_PAYLOAD);
+                    comms_write(&temp_packet);
+                    simple_timer_reset(&timer);
+                    state = BL_State_WaitForUpdateReq;
+                }
+                else    {
+                    check_for_timeout();
+                }
+            }
+            else {
+                check_for_timeout();
+            }
+            continue;
+        }
+        
+        comms_update();
+        
+        switch (state) {
+            case BL_State_WaitForUpdateReq: {
+                if(comms_packets_available()) {
+                     comms_read(&temp_packet);
+                 if(comms_is_single_byte_packet(&temp_packet, BL_PACKET_FW_UPDATE_REQ_PAYLOAD))   {
+                        comms_create_single_byte_packet(&temp_packet, BL_PACKET_FW_UPDATE_RES_PAYLOAD);
                         comms_write(&temp_packet);
                         simple_timer_reset(&timer);
-                        state = BL_State_WaitForUpdateReq;
+                        state = BL_State_DeviceIDReq;
                     }
-                    else    {
+                        else{
                         check_for_timeout();
                     }
                 }
-                else {
+                else{
                     check_for_timeout();
                 }
-                continue;
-             }
-             comms_update();
-             switch (state) {
-                    case BL_State_WaitForUpdateReq: {
-                        if(comms_packets_available()) {
-                            comms_read(&temp_packet);
-
-                            if(comms_is_single_byte_packet(&temp_packet, BL_PACKET_FW_UPDATE_REQ_PAYLOAD))   {
-                                comms_create_single_byte_packet(&temp_packet, BL_PACKET_FW_UPDATE_RES_PAYLOAD);
-                                comms_write(&temp_packet);
-                                simple_timer_reset(&timer);
-                                state = BL_State_DeviceIDReq;
-                            }
-                            else{
-                                check_for_timeout();
-                            }
-                        }
-                        else{
-                            check_for_timeout();
-                        }
-                        break;
-                    }
-
-                    case BL_State_DeviceIDReq:  {
-                        comms_create_single_byte_packet(&temp_packet, BL_PACKET_DEVICE_ID_REQ_PAYLOAD);
-                        comms_write(&temp_packet);
+                break;
+            }
+            case BL_State_DeviceIDReq:  {
+                comms_create_single_byte_packet(&temp_packet, BL_PACKET_DEVICE_ID_REQ_PAYLOAD);
+                comms_write(&temp_packet);
+                simple_timer_reset(&timer);
+                state = BL_State_DeviceIDRes;
+                break;
+            }
+            case BL_State_DeviceIDRes:  {
+                if(comms_packets_available()) {
+                    comms_read(&temp_packet);
+                    if(is_device_id_packet(&temp_packet)&& temp_packet.payload[1]==DEVICE_ID)   {
+                        
                         simple_timer_reset(&timer);
-                        state = BL_State_DeviceIDRes;
-                        break;
+                        state = BL_State_FWLengthReq;
                     }
-
-                    case BL_State_DeviceIDRes:  {
-                        if(comms_packets_available()) {
-                            comms_read(&temp_packet);
-
-                            if(is_device_id_packet(&temp_packet)&& temp_packet.payload[1]==DEVICE_ID)   {
-                                
-                                simple_timer_reset(&timer);
-                                state = BL_State_FWLengthReq;
-                            }
-                            else{
-                                check_for_timeout();
-                            }
-                        }
-                        else{
-                            check_for_timeout();
-                        }
-                        break;
+                    else{
+                        check_for_timeout();
                     }
-
-                    case BL_State_FWLengthReq:  {
-                        comms_create_single_byte_packet(&temp_packet, BL_PACKET_FW_LENGTH_REQ_PAYLOAD);
-                        comms_write(&temp_packet);
+                }
+                else{
+                    check_for_timeout();
+                }
+                break;
+            }
+            case BL_State_FWLengthReq:  {
+                comms_create_single_byte_packet(&temp_packet, BL_PACKET_FW_LENGTH_REQ_PAYLOAD);
+                comms_write(&temp_packet);
+                simple_timer_reset(&timer);
+                state = BL_State_FWLengthRes;
+                break;
+            }
+            case BL_State_FWLengthRes:  {
+                if(comms_packets_available()) {
+                    comms_read(&temp_packet);
+                    fw_length = (
+                        (temp_packet.payload[1])         |
+                        (temp_packet.payload[2] << 8)    |
+                        (temp_packet.payload[3] << 16)   |
+                        (temp_packet.payload[4] << 24)   
+                    );
+                    if(is_fw_length_packet(&temp_packet) && fw_length <= MAX_FW_LENGTH)   {
                         simple_timer_reset(&timer);
-                        state = BL_State_FWLengthRes;
-                        break;
+                        state = BL_State_EraseApplication;
                     }
-
-                    case BL_State_FWLengthRes:  {
-                        if(comms_packets_available()) {
-                            comms_read(&temp_packet);
-                            fw_length = (
-                                (temp_packet.payload[1])         |
-                                (temp_packet.payload[2] << 8)    |
-                                (temp_packet.payload[3] << 16)   |
-                                (temp_packet.payload[4] << 24)   
-                            );
-                            if(is_fw_length_packet(&temp_packet) && fw_length <= MAX_FW_LENGTH)   {
-                                simple_timer_reset(&timer);
-                                state = BL_State_EraseApplication;
-                            }
-                            else{
-                                check_for_timeout();
-                            }
-                        }
-                        else{
-                            check_for_timeout();
-                        }
-                        break;
+                    else{
+                        check_for_timeout();
                     }
-
-                    case BL_State_EraseApplication: {
-                        bootloader_flash_erase_main_application();
-
+                }
+                else{
+                    check_for_timeout();
+                }
+                break;
+            }
+            case BL_State_EraseApplication: {
+                bootloader_flash_erase_main_application();
+                comms_create_single_byte_packet(&temp_packet, BL_PACKET_READY_FOR_FW_PAYLOAD);
+                comms_write(&temp_packet);
+                simple_timer_reset(&timer);
+                state = BL_State_Receive_FW;
+                break;
+            }
+            case BL_State_Receive_FW:   {
+                if(comms_packets_available()) {
+                    comms_read(&temp_packet);
+                    if(system_get_ticks()-last_led_toggle >=15)   {
+                        gpio_toggle(LED_PORT,LED_PIN);
+                        last_led_toggle = system_get_ticks();
+                    }
+                    const uint8_t packet_length = (temp_packet.length & 0x0F) + 1;
+                    bootloader_flash_write((MAIN_APP_START_ADDRESS + bytes_written), &temp_packet.payload[0], (uint32_t)packet_length);
+                    bytes_written += packet_length;
+                    if(bytes_written >= fw_length)  {
+                        comms_create_single_byte_packet(&temp_packet, BL_PACKET_UPDATE_SUCCESSFUL_PAYLOAD);
+                        comms_write(&temp_packet);
+                        
+                        state = BL_State_Done;
+                        gpio_set(LED_PORT, LED_PIN);
+                    }
+                    else{
                         comms_create_single_byte_packet(&temp_packet, BL_PACKET_READY_FOR_FW_PAYLOAD);
                         comms_write(&temp_packet);
-
-                        simple_timer_reset(&timer);
-                        state = BL_State_Receive_FW;
-                        break;
                     }
-
-                    case BL_State_Receive_FW:   {
-                        if(comms_packets_available()) {
-                            comms_read(&temp_packet);
-                            
-                            const uint8_t packet_length = (temp_packet.length & 0x0F) + 1;
-                            bootloader_flash_write((MAIN_APP_START_ADDRESS + bytes_written), &temp_packet.payload[0], (uint32_t)packet_length);
-                            bytes_written += packet_length;
-
-                            if(bytes_written >= fw_length)  {
-                                comms_create_single_byte_packet(&temp_packet, BL_PACKET_UPDATE_SUCCESSFUL_PAYLOAD);
-                                comms_write(&temp_packet);
-                                
-                                state = BL_State_Done;
-                            }
-                            else{
-                                comms_create_single_byte_packet(&temp_packet, BL_PACKET_READY_FOR_FW_PAYLOAD);
-                                comms_write(&temp_packet);
-                            }
-                        }
-                        else{
-                            check_for_timeout();
-                        }
-                        break;
-                    }
-
-                    default:    {
-                        state = BL_State_Sync;
-                    }
-             }
-        
+                }
+                else{
+                    check_for_timeout();
+                }
+                break;
+            }
+            default:    {
+                state = BL_State_Sync;
+            }
+         }
+        check_for_timeout();
     }
 
     // Teardown peripherals from update
@@ -295,9 +308,13 @@ int main(void)  {
     system_teardown();
     gpio_teardown();
 
-    // Jump to the main application
-    jump_to_main_application();
-
+    if(validate_firmware_image())   {
+        // Jump to the main application
+        jump_to_main_application();
+    }
+    else    {
+       scb_reset_core();
+    }
     // Never return
     return 0;
 }

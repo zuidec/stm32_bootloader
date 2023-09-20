@@ -63,9 +63,10 @@ OBJS		+= $(SHARED_SRC_DIR)/core/timer.o
 OBJS		+= $(SHARED_SRC_DIR)/core/uart.o
 OBJS		+= $(SHARED_SRC_DIR)/core/fifo.o
 OBJS		+= $(SHARED_SRC_DIR)/core/comms.o
-OBJS		+= $(SHARED_SRC_DIR)/core/crc8.o
+OBJS		+= $(SHARED_SRC_DIR)/core/crc.o
 OBJS		+= $(SHARED_SRC_DIR)/core/bootloader-flash.o
 OBJS		+= $(SHARED_SRC_DIR)/core/simple-timer.o
+OBJS		+= $(SHARED_SRC_DIR)/core/firmware-info.o
 
 ###############################################################################
 # C flags
